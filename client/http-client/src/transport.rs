@@ -42,7 +42,7 @@ pub struct HttpTransportClient {
 	/// Target to connect to.
 	target: Uri,
 	/// HTTP client
-	client: HyperClient,
+	pub client: HyperClient,
 	/// Configurable max request body size
 	max_request_size: u32,
 	/// Configurable max response body size

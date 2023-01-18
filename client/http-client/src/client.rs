@@ -183,7 +183,7 @@ impl Default for HttpClientBuilder {
 #[derive(Debug, Clone)]
 pub struct HttpClient {
 	/// HTTP transport client.
-	transport: HttpTransportClient,
+	pub transport: HttpTransportClient,
 	/// Request timeout. Defaults to 60sec.
 	request_timeout: Duration,
 	/// Request ID manager.
