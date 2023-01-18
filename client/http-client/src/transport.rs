@@ -18,7 +18,7 @@ use thiserror::Error;
 const CONTENT_TYPE_JSON: &str = "application/json";
 
 #[derive(Debug, Clone)]
-enum HyperClient {
+pub enum HyperClient {
 	/// Hyper client with https connector.
 	#[cfg(feature = "tls")]
 	Https(Client<hyper_rustls::HttpsConnector<HttpConnector>>),
