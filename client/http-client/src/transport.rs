@@ -8,6 +8,7 @@
 
 use std::io;
 
+use hyper::body::{Body, HttpBody};
 use hyper::client::{Client, HttpConnector};
 use hyper::http::{HeaderMap, HeaderValue};
 use hyper::Uri;
@@ -15,41 +16,84 @@ use jsonrpsee_core::client::CertificateStore;
 use jsonrpsee_core::error::GenericTransportError;
 use jsonrpsee_core::http_helpers;
 use jsonrpsee_core::tracing::{rx_log_from_bytes, tx_log_from_str};
+use std::error::Error as StdError;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use thiserror::Error;
+use tower::{Layer, Service, ServiceExt};
 
 const CONTENT_TYPE_JSON: &str = "application/json";
 
-#[derive(Debug, Clone)]
-enum HyperClient {
+/// Wrapper over HTTP transport and connector.
+#[derive(Debug)]
+pub enum HttpBackend<B = Body> {
 	/// Hyper client with https connector.
 	#[cfg(feature = "tls")]
-	Https(Client<hyper_rustls::HttpsConnector<HttpConnector>>),
+	Https(Client<hyper_rustls::HttpsConnector<HttpConnector>, B>),
 	/// Hyper client with http connector.
-	Http(Client<HttpConnector>),
-	/// Hyper client with proxy connector.
+	Http(Client<HttpConnector, B>),
+	/// Hyper client with proxy connector and TLS support.
 	#[cfg(all(feature = "proxy", feature = "tls"))]
-	Proxy(Client<hyper_proxy::ProxyConnector<hyper_rustls::HttpsConnector<HttpConnector>>>),
+	HttpsProxy(Client<hyper_proxy::ProxyConnector<hyper_rustls::HttpsConnector<HttpConnector>>, B>),
+	/// Hyper client with a proxy but no TLS support.
+	#[cfg(all(feature = "proxy"))]
+	HttpProxy(Client<hyper_proxy::ProxyConnector<HttpConnector>, B>),
 }
 
-impl HyperClient {
-	fn request(&self, req: hyper::Request<hyper::Body>) -> hyper::client::ResponseFuture {
+impl Clone for HttpBackend {
+	fn clone(&self) -> Self {
 		match self {
-			Self::Http(client) => client.request(req),
-			#[cfg(feature = "tls")]
-			Self::Https(client) => client.request(req),
+			Self::Http(inner) => Self::Http(inner.clone()),
 			#[cfg(all(feature = "proxy", feature = "tls"))]
-			Self::Proxy(client) => client.request(req),
+			Self::HttpsProxy(client) => Self::HttpsProxy(client.clone()),
+			Self::HttpProxy(client) => Self::HttpProxy(client.clone()),
+			Self::Https(inner) => Self::Https(inner.clone()),
 		}
+	}
+}
+
+impl<B> tower::Service<hyper::Request<B>> for HttpBackend<B>
+where
+	B: HttpBody + Send + 'static,
+	B::Data: Send,
+	B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+	type Response = hyper::Response<Body>;
+	type Error = Error;
+	type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+	fn poll_ready(&mut self, ctx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+		match self {
+			Self::Http(inner) => inner.poll_ready(ctx),
+			#[cfg(feature = "tls")]
+			Self::Https(inner) => inner.poll_ready(ctx),
+			HttpBackend::HttpsProxy(inner) => inner.poll_ready(ctx),
+			HttpBackend::HttpProxy(inner) => inner.poll_ready(ctx),
+		}
+		.map_err(Into::into)
+	}
+
+	fn call(&mut self, req: hyper::Request<B>) -> Self::Future {
+		let resp = match self {
+			Self::Http(inner) => inner.call(req),
+			#[cfg(feature = "tls")]
+			Self::Https(inner) => inner.call(req),
+			HttpBackend::HttpsProxy(inner) => inner.call(req),
+			HttpBackend::HttpProxy(inner) => inner.call(req),
+		};
+
+		Box::pin(async move { resp.await.map_err(Into::into) })
 	}
 }
 
 /// HTTP Transport Client.
 #[derive(Debug, Clone)]
-pub struct HttpTransportClient {
+pub struct HttpTransportClient<S> {
 	/// Target to connect to.
-	target: Uri,
+	target: ParsedUri,
 	/// HTTP client
-	client: HyperClient,
+	client: S,
 	/// Configurable max request body size
 	max_request_size: u32,
 	/// Configurable max response body size
@@ -62,9 +106,15 @@ pub struct HttpTransportClient {
 	headers: HeaderMap,
 }
 
-impl HttpTransportClient {
+impl<B, S> HttpTransportClient<S>
+where
+	S: Service<hyper::Request<Body>, Response = hyper::Response<B>, Error = Error> + Clone,
+	B: HttpBody + Send + 'static,
+	B::Data: Send,
+	B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
 	/// Initializes a new HTTP client.
-	pub(crate) fn new(
+	pub(crate) fn new<L: Layer<HttpBackend<Body>, Service = S>>(
 		max_request_size: u32,
 		target: impl AsRef<str>,
 		max_response_size: u32,
@@ -72,14 +122,25 @@ impl HttpTransportClient {
 		max_log_length: u32,
 		headers: HeaderMap,
 		proxy: Option<Uri>,
+		service_builder: tower::ServiceBuilder<L>,
 	) -> Result<Self, Error> {
-		let target: Uri = target.as_ref().parse().map_err(|e| Error::Url(format!("Invalid URL: {}", e)))?;
-		if target.port_u16().is_none() {
-			return Err(Error::Url("Port number is missing in the URL".into()));
-		}
+		let uri = ParsedUri::try_from(target.as_ref())?;
 
-		let client = match target.scheme_str() {
-			Some("http") => HyperClient::Http(Client::new()),
+		let client = match uri.0.scheme_str() {
+			Some("http") => {
+				let connector = HttpConnector::new();
+				match proxy {
+					#[cfg(feature = "proxy")]
+					Some(pr) => {
+						let proxy_obj = hyper_proxy::Proxy::new(hyper_proxy::Intercept::All, pr);
+						let proxy_connector =
+							hyper_proxy::ProxyConnector::from_proxy(connector, proxy_obj).map_err(Error::from)?;
+						HttpBackend::HttpProxy(Client::builder().build::<_, hyper::Body>(proxy_connector))
+					}
+					// proxy can only be configured when the `proxy` feature is enabled.
+					_ => HttpBackend::Http(Client::builder().build::<_, hyper::Body>(connector)),
+				}
+			},
 			#[cfg(feature = "tls")]
 			Some("https") => {
 				let connector = match cert_store {
@@ -101,10 +162,10 @@ impl HttpTransportClient {
 						let proxy_obj = hyper_proxy::Proxy::new(hyper_proxy::Intercept::All, pr);
 						let proxy_connector =
 							hyper_proxy::ProxyConnector::from_proxy(connector, proxy_obj).map_err(Error::from)?;
-						HyperClient::Proxy(Client::builder().build::<_, hyper::Body>(proxy_connector))
+						HttpBackend::HttpsProxy(Client::builder().build::<_, hyper::Body>(proxy_connector))
 					}
 					// proxy can only be configured when the `proxy` feature is enabled.
-					_ => HyperClient::Https(Client::builder().build::<_, hyper::Body>(connector)),
+					_ => HttpBackend::Https(Client::builder().build::<_, hyper::Body>(connector)),
 				}
 			}
 			_ => {
@@ -128,23 +189,30 @@ impl HttpTransportClient {
 			}
 		}
 
-		Ok(Self { target, client, max_request_size, max_response_size, max_log_length, headers: cached_headers })
+		Ok(Self {
+			target: uri,
+			client: service_builder.service(client),
+			max_request_size,
+			max_response_size,
+			max_log_length,
+			headers: cached_headers,
+		})
 	}
 
-	async fn inner_send(&self, body: String) -> Result<hyper::Response<hyper::Body>, Error> {
+	async fn inner_send(&self, body: String) -> Result<hyper::Response<B>, Error> {
 		tx_log_from_str(&body, self.max_log_length);
 
 		if body.len() > self.max_request_size as usize {
 			return Err(Error::RequestTooLarge);
 		}
 
-		let mut req = hyper::Request::post(&self.target);
+		let mut req = hyper::Request::post(&self.target.0);
 		if let Some(headers) = req.headers_mut() {
 			*headers = self.headers.clone();
 		}
 		let req = req.body(From::from(body)).expect("URI and request headers are valid; qed");
+		let response = self.client.clone().ready().await?.call(req).await?;
 
-		let response = self.client.request(req).await.map_err(|e| Error::Http(Box::new(e)))?;
 		if response.status().is_success() {
 			Ok(response)
 		} else {
@@ -168,6 +236,22 @@ impl HttpTransportClient {
 		let _ = self.inner_send(body).await?;
 
 		Ok(())
+	}
+}
+
+#[derive(Debug, Clone)]
+struct ParsedUri(Uri);
+
+impl TryFrom<&str> for ParsedUri {
+	type Error = Error;
+
+	fn try_from(target: &str) -> Result<Self, Self::Error> {
+		let uri: Uri = target.parse().map_err(|e| Error::Url(format!("Invalid URL: {e}")))?;
+		if uri.port_u16().is_none() {
+			Err(Error::Url("Port number is missing in the URL".into()))
+		} else {
+			Ok(ParsedUri(uri))
+		}
 	}
 }
 
@@ -206,35 +290,39 @@ pub enum Error {
 	Io(#[from] io::Error),
 }
 
-impl<T> From<GenericTransportError<T>> for Error
-where
-	T: std::error::Error + Send + Sync + 'static,
-{
-	fn from(err: GenericTransportError<T>) -> Self {
+impl From<GenericTransportError> for Error {
+	fn from(err: GenericTransportError) -> Self {
 		match err {
-			GenericTransportError::<T>::TooLarge => Self::RequestTooLarge,
-			GenericTransportError::<T>::Malformed => Self::Malformed,
-			GenericTransportError::<T>::Inner(e) => Self::Http(Box::new(e)),
+			GenericTransportError::TooLarge => Self::RequestTooLarge,
+			GenericTransportError::Malformed => Self::Malformed,
+			GenericTransportError::Inner(e) => Self::Http(e.into()),
 		}
+	}
+}
+
+impl From<hyper::Error> for Error {
+	fn from(err: hyper::Error) -> Self {
+		Self::Http(Box::new(err))
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use jsonrpsee_core::client::CertificateStore;
 
 	fn assert_target(
-		client: &HttpTransportClient,
+		client: &HttpTransportClient<HttpBackend>,
 		host: &str,
 		scheme: &str,
 		path_and_query: &str,
 		port: u16,
 		max_request_size: u32,
 	) {
-		assert_eq!(client.target.scheme_str(), Some(scheme));
-		assert_eq!(client.target.path_and_query().map(|pq| pq.as_str()), Some(path_and_query));
-		assert_eq!(client.target.host(), Some(host));
-		assert_eq!(client.target.port_u16(), Some(port));
+		assert_eq!(client.target.0.scheme_str(), Some(scheme));
+		assert_eq!(client.target.0.path_and_query().map(|pq| pq.as_str()), Some(path_and_query));
+		assert_eq!(client.target.0.host(), Some(host));
+		assert_eq!(client.target.0.port_u16(), Some(port));
 		assert_eq!(client.max_request_size, max_request_size);
 	}
 
@@ -248,6 +336,7 @@ mod tests {
 			80,
 			HeaderMap::new(),
 			None,
+			tower::ServiceBuilder::new(),
 		)
 		.unwrap_err();
 		assert!(matches!(err, Error::Url(_)));
@@ -264,6 +353,7 @@ mod tests {
 			80,
 			HeaderMap::new(),
 			None,
+			tower::ServiceBuilder::new(),
 		)
 		.unwrap();
 		assert_target(&client, "localhost", "https", "/", 9933, 80);
@@ -280,6 +370,7 @@ mod tests {
 			80,
 			HeaderMap::new(),
 			None,
+			tower::ServiceBuilder::new(),
 		)
 		.unwrap_err();
 		assert!(matches!(err, Error::Url(_)));
@@ -295,6 +386,7 @@ mod tests {
 			80,
 			HeaderMap::new(),
 			None,
+			tower::ServiceBuilder::new(),
 		)
 		.unwrap_err();
 		assert!(matches!(err, Error::Url(_)));
@@ -306,6 +398,7 @@ mod tests {
 			80,
 			HeaderMap::new(),
 			None,
+			tower::ServiceBuilder::new(),
 		)
 		.unwrap_err();
 		assert!(matches!(err, Error::Url(_)));
@@ -321,6 +414,7 @@ mod tests {
 			80,
 			HeaderMap::new(),
 			None,
+			tower::ServiceBuilder::new(),
 		)
 		.unwrap();
 		assert_target(&client, "localhost", "http", "/my-special-path", 9944, 1337);
@@ -336,6 +430,7 @@ mod tests {
 			80,
 			HeaderMap::new(),
 			None,
+			tower::ServiceBuilder::new(),
 		)
 		.unwrap();
 		assert_target(&client, "127.0.0.1", "http", "/my?name1=value1&name2=value2", 9999, u32::MAX);
@@ -351,6 +446,7 @@ mod tests {
 			80,
 			HeaderMap::new(),
 			None,
+			tower::ServiceBuilder::new(),
 		)
 		.unwrap();
 		assert_target(&client, "127.0.0.1", "http", "/my.htm", 9944, 999);
@@ -369,6 +465,7 @@ mod tests {
 			99,
 			HeaderMap::new(),
 			None,
+			tower::ServiceBuilder::new(),
 		)
 		.unwrap();
 		assert_eq!(client.max_request_size, eighty_bytes_limit);
