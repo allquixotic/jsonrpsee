@@ -13,8 +13,8 @@ documentation = "https://docs.rs/jsonrpsee-http-client"
 async-trait = "0.1"
 rustc-hash = "1"
 hyper = { version = "0.14.10", features = ["client", "http1", "http2", "tcp"] }
-hyper-rustls = { version = "0.23", optional = true }
 hyper-proxy = { version = "0.9", default-features = false, optional = true }
+hyper-rustls = { version = "0.23", optional = true, default-features = false, features = ["http1", "tls12", "logging"] }
 jsonrpsee-types = { path = "../../types", version = "0.16.2" }
 jsonrpsee-core = { path = "../../core", version = "0.16.2", features = ["client", "http-helpers"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
@@ -30,9 +30,14 @@ jsonrpsee-test-utils = { path = "../../test-utils" }
 tokio = { version = "1.16", features = ["net", "rt-multi-thread", "macros"] }
 
 [features]
-default = ["tls", "proxy"]
-tls = ["hyper-rustls/webpki-tokio"]
-proxy = ["hyper-proxy/rustls", "tls"]
+default = ["native-tls", "proxy"]
+native-tls = ["hyper-rustls/native-tokio", "__tls"]
+webpki-tls = ["hyper-rustls/webpki-tokio", "__tls"]
+proxy = ["hyper-proxy"]
+
+# Internal feature to indicate whether TLS is enabled.
+# Does nothing on its own.
+__tls = ["hyper-rustls"]
 
 [package.metadata.docs.rs]
 all-features = true
