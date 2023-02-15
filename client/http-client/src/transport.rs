@@ -146,7 +146,7 @@ where
 					// proxy can only be configured when the `proxy` feature is enabled.
 					_ => HttpBackend::Http(Client::builder().build::<_, hyper::Body>(connector)),
 				}
-			},
+			}
 			#[cfg(feature = "__tls")]
 			Some("https") | Some("http") => {
 				let connector = match cert_store {
@@ -168,8 +168,7 @@ where
 					#[cfg(all(feature = "proxy", feature = "__tls"))]
 					Some(pr) => {
 						let proxy_obj = hyper_proxy::Proxy::new(hyper_proxy::Intercept::All, pr);
-						let proxy_connector =
-							hyper_proxy::ProxyConnector::from_proxy_unsecured(connector, proxy_obj);
+						let proxy_connector = hyper_proxy::ProxyConnector::from_proxy_unsecured(connector, proxy_obj);
 						HttpBackend::HttpsProxy(Client::builder().build::<_, hyper::Body>(proxy_connector))
 					}
 					// proxy can only be configured when the `proxy` feature is enabled.
