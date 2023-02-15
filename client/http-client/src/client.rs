@@ -35,8 +35,8 @@ use crate::types::{ErrorResponse, NotificationSer, RequestSer, Response};
 use async_trait::async_trait;
 use hyper::body::HttpBody;
 use hyper::http::HeaderMap;
-use hyper::Uri;
 use hyper::Body;
+use hyper::Uri;
 use jsonrpsee_core::client::{
 	generate_batch_id_range, BatchResponse, CertificateStore, ClientT, IdKind, RequestIdManager, Subscription,
 	SubscriptionClientT,
@@ -177,7 +177,7 @@ impl<L> HttpClientBuilder<L> {
 	/// Set the HTTP(S) proxy that will proxy every HTTP request (default is none).
 	///
 	/// The proxy should be of the form <http://host_or_ip:port> (without the brackets).
-	#[cfg(all(feature = "proxy", feature = "tls"))]
+	#[cfg(all(feature = "proxy", feature = "__tls"))]
 	pub fn set_proxy(mut self, proxy: impl AsRef<str>) -> Result<Self, Error> {
 		let result =
 			proxy.as_ref().parse().map_err(|_| Error::Transport(InvalidProxyUrl(proxy.as_ref().to_owned()).into()))?;
@@ -197,7 +197,7 @@ impl<L> HttpClientBuilder<L> {
 			max_response_size: self.max_response_size,
 			service_builder,
 			request_timeout: self.request_timeout,
-			proxy: self.proxy
+			proxy: self.proxy,
 		}
 	}
 }
